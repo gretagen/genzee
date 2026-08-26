@@ -1,0 +1,681 @@
+#!/bin/bash
+# genzee — btrfs generation manager for Zerene OS (Limine boot entries)
+set -euo pipefail
+
+# help can run unprivileged; everything else needs root
+case "${1:-help}" in
+    help|-h|--help) ;;
+    *)
+        if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+            echo "Managing generations requires superuser privileges."
+            exit
+        fi
+        ;;
+esac
+
+
+SNAP_MOUNT="${GENZEE_SNAP_MOUNT:-/.snapshots}"
+LIMINE_CONF="${GENZEE_LIMINE:-/boot/limine.conf}"
+LIVE_SUBVOL="@"
+SNAPS_SUBVOL="@snapshots"
+NEXT_SUBVOL="@.next"
+
+# Helpers
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "[info] $*"; }
+ok() { echo "[ok] $*"; }
+
+root_device() {
+    findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//' | head -1
+}
+
+root_uuid() {
+    findmnt -n -o UUID / 2>/dev/null || true
+}
+
+root_partuuid() {
+    findmnt -n -o PARTUUID / 2>/dev/null || true
+}
+
+root_spec() {
+    local u p dev
+    u=$(root_uuid)
+    if [ -n "$u" ]; then
+        echo "UUID=$u"
+        return
+    fi
+    p=$(root_partuuid)
+    if [ -n "$p" ]; then
+        echo "PARTUUID=$p"
+        return
+    fi
+    dev=$(root_device)
+    [ -n "$dev" ] || die "could not determine root device"
+    echo "$dev"
+}
+
+current_subvol() {
+    local src opt
+    src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    case "$src" in
+        *\[*\])
+            src=${src#*\[}
+            src=${src%\]*}
+            # strip leading /
+            src=${src#/}
+            echo "$src"
+            return
+            ;;
+    esac
+    opt=$(findmnt -n -o OPTIONS / 2>/dev/null | tr ',' '\n' | sed -n 's/^subvol=\///p; s/^subvol=//p' | head -1)
+    echo "$opt"
+}
+
+find_kernel() {
+    local candidates=()
+    local k
+    for k in /boot/vmlinuz-*; do
+        [ -f "$k" ] || continue
+        candidates+=("$k")
+    done
+    if [ ${#candidates[@]} -gt 0 ]; then
+        # Sort by version (highest last) and return the latest
+        local latest
+        latest=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -1)
+        basename "$latest"
+        return 0
+    fi
+    # Fallback to generic names
+    for k in /boot/vmlinuz /boot/bzImage; do
+        [ -f "$k" ] || continue
+        basename "$k"
+        return 0
+    done
+    return 1
+}
+
+find_initrd() {
+    local kernel_ver="${1:-}"
+    local candidates=()
+    local i
+
+    # If kernel version provided, look for matching initramfs first
+    if [ -n "$kernel_ver" ]; then
+        for i in "/boot/initramfs-${kernel_ver}.img" "/boot/initrd-${kernel_ver}" "/boot/initrd-${kernel_ver}.img"; do
+            [ -f "$i" ] || continue
+            basename "$i"
+            return 0
+        done
+    fi
+
+    # Collect all initramfs candidates
+    for i in /boot/initramfs-*.img; do
+        [ -f "$i" ] || continue
+        candidates+=("$i")
+    done
+    if [ ${#candidates[@]} -gt 0 ]; then
+        # Sort by version (highest last) and return the latest
+        local latest
+        latest=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -1)
+        basename "$latest"
+        return 0
+    fi
+
+    # Fallback to generic names
+    for i in /boot/initramfs-installed.img /boot/initrd.img* /boot/initrd-*; do
+        [ -f "$i" ] || continue
+        basename "$i"
+        return 0
+    done
+    return 1
+}
+
+mount_toplevel() {
+    local dev tmp
+    dev=$(root_device)
+    [ -n "$dev" ] || die "could not detect root device (is / on btrfs?)"
+    tmp=$(mktemp -d /tmp/genzee-tl.XXXXXX)
+    if ! mount -t btrfs -o subvol=/ "$dev" "$tmp" 2>/dev/null; then
+        rmdir "$tmp" 2>/dev/null || true
+        die "failed to mount btrfs top-level on $dev"
+    fi
+    echo "$tmp"
+}
+
+ensure_layout() {
+    local tl
+    tl=$(mount_toplevel)
+    if [ ! -d "$tl/$LIVE_SUBVOL" ] && [ ! -d "$tl/$NEXT_SUBVOL" ]; then
+        umount "$tl" 2>/dev/null || true
+        rmdir "$tl" 2>/dev/null || true
+        die "missing subvolume '$LIVE_SUBVOL' — reinstall with current zstrappa or create layout manually"
+    fi
+    if [ ! -d "$tl/$SNAPS_SUBVOL" ]; then
+        info "creating $SNAPS_SUBVOL subvolume..."
+        btrfs subvolume create "$tl/$SNAPS_SUBVOL" \
+            || { umount "$tl"; rmdir "$tl"; die "failed to create $SNAPS_SUBVOL"; }
+    fi
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+}
+
+ensure_snapshots_mounted() {
+    ensure_layout
+    mkdir -p "$SNAP_MOUNT"
+    if mountpoint -q "$SNAP_MOUNT" 2>/dev/null; then
+        return 0
+    fi
+    local dev
+    dev=$(root_device)
+    mount -t btrfs -o "subvol=$SNAPS_SUBVOL" "$dev" "$SNAP_MOUNT" \
+        || die "failed to mount $SNAPS_SUBVOL on $SNAP_MOUNT"
+}
+
+resolve_id() {
+    local input="$1" name
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        name="gen-$input"
+    elif [[ "$input" =~ ^gen-[0-9]+$ ]]; then
+        name="$input"
+    else
+        die "invalid generation id '$input' (use N or gen-N)"
+    fi
+    [ -d "$SNAP_MOUNT/$name" ] || die "generation '$name' not found"
+    echo "$name"
+}
+
+next_id() {
+    local n=1
+    while [ -d "$SNAP_MOUNT/gen-$n" ]; do
+        n=$((n + 1))
+    done
+    echo "$n"
+}
+
+write_meta_file() {
+    local path="$1" id="$2" desc="$3" ts
+    ts=$(date +%s)
+    # escape quotes in description
+    desc=${desc//\"/\\\"}
+    cat > "$path" <<EOF
+id = "$id"
+timestamp = $ts
+description = "$desc"
+EOF
+}
+
+meta_path() {
+    local id="$1"
+    if [ -f "$SNAP_MOUNT/$id/meta.toml" ]; then
+        echo "$SNAP_MOUNT/$id/meta.toml"
+    else
+        echo "$SNAP_MOUNT/${id}.meta.toml"
+    fi
+}
+
+load_meta_desc() {
+    local f
+    f=$(meta_path "$1")
+    [ -f "$f" ] || return 0
+    sed -n 's/^description = "\(.*\)"/\1/p' "$f" | head -1
+}
+
+load_meta_ts() {
+    local f
+    f=$(meta_path "$1")
+    [ -f "$f" ] || return 0
+    sed -n 's/^timestamp = //p' "$f" | head -1
+}
+
+read_current() {
+    if [ -f "$SNAP_MOUNT/.current" ]; then
+        tr -d '[:space:]' < "$SNAP_MOUNT/.current"
+    fi
+}
+
+set_current() {
+    printf '%s\n' "$1" > "$SNAP_MOUNT/.current"
+}
+
+cmdline_extras() {
+    local conf="$LIMINE_CONF" line extras="" tok
+    [ -f "$conf" ] || { echo ""; return 0; }
+    line=$(grep -m1 '^[[:space:]]*cmdline:' "$conf" 2>/dev/null || true)
+    line=${line#*cmdline:}
+    line=$(echo "$line" | sed 's/^[[:space:]]*//')
+    for tok in $line; do
+        case "$tok" in
+            root=*|rootflags=*|rw|ro) ;;
+            *) extras="${extras:+$extras }$tok" ;;
+        esac
+    done
+    echo "$extras"
+}
+
+limine_global() {
+    local key="$1" default="$2" conf="$LIMINE_CONF" val
+    if [ -f "$conf" ]; then
+        val=$(grep -m1 "^${key}:" "$conf" 2>/dev/null | sed "s/^${key}:[[:space:]]*//" || true)
+        if [ -n "$val" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+# Default live subvolume for the primary Limine entry (@ or @.next after pending rollback)
+default_live_subvol() {
+    local conf="$LIMINE_CONF" flags
+    if [ -f "$conf" ]; then
+        flags=$(grep -m1 '^[[:space:]]*cmdline:' "$conf" 2>/dev/null | grep -o 'rootflags=subvol=[^ ]*' | head -1 || true)
+        flags=${flags#rootflags=subvol=}
+        case "$flags" in
+            @|"$LIVE_SUBVOL") echo "$LIVE_SUBVOL"; return ;;
+            @.next|"$NEXT_SUBVOL") echo "$NEXT_SUBVOL"; return ;;
+        esac
+    fi
+    local booted
+    booted=$(current_subvol)
+    case "$booted" in
+        "$NEXT_SUBVOL"|@.next) echo "$NEXT_SUBVOL" ;;
+        *) echo "$LIVE_SUBVOL" ;;
+    esac
+}
+
+# Limine rewrite
+
+rewrite_limine() {
+    local live_subvol="${1:-}"
+    ensure_snapshots_mounted
+
+    if [ -z "$live_subvol" ]; then
+        live_subvol=$(default_live_subvol)
+    fi
+
+    local kernel initrd kernel_ver rspec extras timeout serial wallpaper
+    kernel=$(find_kernel) || die "no kernel found in /boot"
+    # Extract version from kernel filename (vmlinuz-X.Y.Z-gen -> X.Y.Z-gen)
+    kernel_ver="${kernel#vmlinuz-}"
+    initrd=$(find_initrd "$kernel_ver") || die "no initramfs found in /boot"
+    rspec=$(root_spec)
+    extras=$(cmdline_extras)
+    timeout=$(limine_global "timeout" "15")
+    serial=$(limine_global "serial" "yes")
+    wallpaper=$(limine_global "wallpaper" "")
+
+    local live_cmd gen_cmd
+    live_cmd="root=${rspec} rootflags=subvol=${live_subvol} rw"
+    [ -n "$extras" ] && live_cmd="$live_cmd $extras"
+
+    local tmp name num
+    tmp=$(mktemp)
+    {
+        echo "# Limine configuration for Zerene OS — managed by genzee"
+        echo "# Do not hand-edit generation entries; run: genzee rewrite-limine"
+        echo
+        echo "timeout: $timeout"
+        echo "serial: $serial"
+        if [ -n "$wallpaper" ]; then
+            echo "wallpaper: $wallpaper"
+            echo "wallpaper_style: stretched"
+        fi
+        echo
+        echo "/Zerene OS"
+        echo "    protocol: linux"
+        echo "    kernel_path: boot():/${kernel}"
+        echo "    module_path: boot():/${initrd}"
+        echo "    cmdline: $live_cmd"
+        echo
+
+        local gens=()
+        local d
+        for d in "$SNAP_MOUNT"/gen-*; do
+            [ -d "$d" ] || continue
+            gens+=("$(basename "$d")")
+        done
+
+        if [ ${#gens[@]} -gt 0 ]; then
+            IFS=$'\n' gens=($(printf '%s\n' "${gens[@]}" | sort -t- -k2 -n))
+            unset IFS
+
+            echo "/Generations"
+            for name in "${gens[@]}"; do
+                num=${name#gen-}
+                gen_cmd="root=${rspec} rootflags=subvol=${SNAPS_SUBVOL}/${name} rw"
+                [ -n "$extras" ] && gen_cmd="$gen_cmd $extras"
+                local desc
+                desc=$(load_meta_desc "$name")
+                desc=${desc:-"(no description)"}
+                echo "    //Generation ${num} — ${desc}"
+                echo "        protocol: linux"
+                echo "        kernel_path: boot():/${kernel}"
+                echo "        module_path: boot():/${initrd}"
+                echo "        cmdline: $gen_cmd"
+            done
+        fi
+    } > "$tmp"
+
+    mkdir -p "$(dirname "$LIMINE_CONF")"
+    mv "$tmp" "$LIMINE_CONF"
+    ok "wrote $LIMINE_CONF (default subvol=${live_subvol})"
+}
+
+# Commands
+
+cmd_create() {
+    local desc="${1:-}"
+    [ -n "$desc" ] || die "missing description (usage: genzee create <description>)"
+
+    # If we previously rolled back to @.next and are now running on it, adopt first
+    cmd_adopt_if_needed
+
+    ensure_snapshots_mounted
+
+    local n id tl source_subvol
+    n=$(next_id)
+    id="gen-$n"
+
+    source_subvol=$(current_subvol)
+    case "$source_subvol" in
+        "$LIVE_SUBVOL"|@|"$NEXT_SUBVOL"|@.next) ;;
+        "$SNAPS_SUBVOL"/*|@snapshots/*)
+            die "refusing to snapshot a read-only generation boot; boot into Zerene OS first"
+            ;;
+        "") source_subvol="$LIVE_SUBVOL" ;;
+    esac
+
+    info "creating generation $id from $source_subvol ($desc)..."
+
+    tl=$(mount_toplevel)
+    if [ ! -d "$tl/$source_subvol" ]; then
+        # fall back to @
+        source_subvol="$LIVE_SUBVOL"
+    fi
+    if ! btrfs subvolume snapshot -r "$tl/$source_subvol" "$tl/$SNAPS_SUBVOL/$id"; then
+        umount "$tl"; rmdir "$tl" 2>/dev/null || true
+        die "btrfs snapshot failed"
+    fi
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+
+    # RO snapshot: store metadata beside the snap
+    write_meta_file "$SNAP_MOUNT/${id}.meta.toml" "$id" "$desc"
+
+    set_current "$id"
+    rewrite_limine
+    ok "generation $id created: $desc"
+}
+
+cmd_list() {
+    ensure_snapshots_mounted 2>/dev/null || {
+        info "no generations found"
+        return 0
+    }
+
+    local current name num desc ts marker
+    current=$(read_current)
+
+    local names=()
+    local d
+    for d in "$SNAP_MOUNT"/gen-*; do
+        [ -d "$d" ] || continue
+        names+=("$(basename "$d")")
+    done
+
+    if [ ${#names[@]} -eq 0 ]; then
+        info "no generations found in $SNAP_MOUNT"
+        return 0
+    fi
+
+    IFS=$'\n' names=($(printf '%s\n' "${names[@]}" | sort -t- -k2 -n))
+    unset IFS
+
+    printf '%s  %-12s  %-20s  %s\n' " " "ID" "DATE" "DESCRIPTION"
+    for name in "${names[@]}"; do
+        num=${name#gen-}
+        desc=$(load_meta_desc "$name")
+        desc=${desc:-"(no description)"}
+        ts=$(load_meta_ts "$name")
+        if [ -n "$ts" ]; then
+            ts=$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")
+        else
+            ts=$(date -r "$SNAP_MOUNT/$name" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        fi
+        if [ "$name" = "$current" ]; then
+            marker="*"
+        else
+            marker=" "
+        fi
+        printf '%s  %-12s  %-20s  %s\n' "$marker" "gen-$num" "$ts" "$desc"
+    done
+}
+
+cmd_current() {
+    ensure_snapshots_mounted 2>/dev/null || true
+    local id desc ts sub
+    id=$(read_current 2>/dev/null || true)
+    sub=$(current_subvol)
+    if [ -z "${id:-}" ]; then
+        info "no current generation set"
+        [ -n "$sub" ] && echo "booted subvolume: $sub"
+        return 0
+    fi
+    desc=$(load_meta_desc "$id")
+    ts=$(load_meta_ts "$id")
+    if [ -n "$ts" ]; then
+        ts=$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")
+    fi
+    echo "current: $id"
+    [ -n "$ts" ] && echo "date:    $ts"
+    [ -n "$desc" ] && echo "desc:    $desc"
+    [ -n "$sub" ] && echo "booted:  $sub"
+}
+
+# If booted from @.next after a deferred rollback, promote it to @.
+cmd_adopt_if_needed() {
+    local booted tl
+    booted=$(current_subvol)
+    case "$booted" in
+        "$NEXT_SUBVOL"|@.next) ;;
+        *) return 0 ;;
+    esac
+
+    info "adopting $NEXT_SUBVOL as $LIVE_SUBVOL..."
+    tl=$(mount_toplevel)
+    # Old @ is unused (we're on @.next)
+    if [ -d "$tl/$LIVE_SUBVOL" ]; then
+        btrfs subvolume delete "$tl/$LIVE_SUBVOL" 2>/dev/null \
+            || btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/@.old-$(date +%s)" 2>/dev/null || true
+        btrfs subvolume delete "$tl/$LIVE_SUBVOL" 2>/dev/null || true
+    fi
+    # btrfs cannot rename subvolumes; snapshot @.next -> @ then delete @.next later
+    if [ ! -d "$tl/$LIVE_SUBVOL" ]; then
+        btrfs subvolume snapshot "$tl/$NEXT_SUBVOL" "$tl/$LIVE_SUBVOL" \
+            || { umount "$tl"; rmdir "$tl"; die "failed to promote $NEXT_SUBVOL to $LIVE_SUBVOL"; }
+    fi
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+
+    # Still running on @.next until reboot; point default boot back at @
+    rewrite_limine "$LIVE_SUBVOL"
+    ok "promoted rollback to $LIVE_SUBVOL — reboot once more to drop $NEXT_SUBVOL"
+    info "after reboot you may run: genzee cleanup-next"
+}
+
+cmd_cleanup_next() {
+    local booted tl
+    booted=$(current_subvol)
+    case "$booted" in
+        "$NEXT_SUBVOL"|@.next)
+            die "still booted from $NEXT_SUBVOL; boot into Zerene OS (@) first"
+            ;;
+    esac
+    tl=$(mount_toplevel)
+    if [ -d "$tl/$NEXT_SUBVOL" ]; then
+        btrfs subvolume delete "$tl/$NEXT_SUBVOL" \
+            || { umount "$tl"; rmdir "$tl"; die "failed to delete $NEXT_SUBVOL"; }
+        ok "deleted $NEXT_SUBVOL"
+    else
+        info "no $NEXT_SUBVOL to clean"
+    fi
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+    rewrite_limine "$LIVE_SUBVOL"
+}
+
+cmd_rollback() {
+    local raw="${1:-}"
+    [ -n "$raw" ] || die "missing generation id (usage: genzee rollback <N>)"
+
+    ensure_snapshots_mounted
+    local id
+    id=$(resolve_id "$raw")
+
+    local booted tl backup
+    booted=$(current_subvol)
+
+    # Recovery path: booted from a generation — can replace @ directly
+    case "$booted" in
+        "$SNAPS_SUBVOL"/*|@snapshots/*)
+            info "booted from snapshot; replacing live $LIVE_SUBVOL with $id..."
+            tl=$(mount_toplevel)
+            backup="gen-backup-$(date +%s)"
+            if [ -d "$tl/$LIVE_SUBVOL" ]; then
+                btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
+                write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" 2>/dev/null || true
+                btrfs subvolume delete "$tl/$LIVE_SUBVOL" \
+                    || { umount "$tl"; rmdir "$tl"; die "failed to delete $LIVE_SUBVOL"; }
+            fi
+            # drop stale @.next
+            [ -d "$tl/$NEXT_SUBVOL" ] && btrfs subvolume delete "$tl/$NEXT_SUBVOL" 2>/dev/null || true
+            btrfs subvolume snapshot "$tl/$SNAPS_SUBVOL/$id" "$tl/$LIVE_SUBVOL" \
+                || { umount "$tl"; rmdir "$tl"; die "failed to snapshot $id -> $LIVE_SUBVOL"; }
+            umount "$tl"
+            rmdir "$tl" 2>/dev/null || true
+            set_current "$id"
+            rewrite_limine "$LIVE_SUBVOL"
+            ok "rolled back to $id — reboot into Zerene OS to activate"
+            return 0
+            ;;
+    esac
+
+    # Live path: cannot delete mounted @ — stage @.next and switch default boot
+    info "staging rollback of $id as $NEXT_SUBVOL (live $LIVE_SUBVOL is mounted)..."
+    tl=$(mount_toplevel)
+    backup="gen-backup-$(date +%s)"
+    btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
+    write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" 2>/dev/null || true
+
+    if [ -d "$tl/$NEXT_SUBVOL" ]; then
+        btrfs subvolume delete "$tl/$NEXT_SUBVOL" 2>/dev/null || true
+    fi
+    btrfs subvolume snapshot "$tl/$SNAPS_SUBVOL/$id" "$tl/$NEXT_SUBVOL" \
+        || { umount "$tl"; rmdir "$tl"; die "failed to create $NEXT_SUBVOL from $id"; }
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+
+    set_current "$id"
+    rewrite_limine "$NEXT_SUBVOL"
+    ok "rollback staged: next boot uses $NEXT_SUBVOL (from $id)"
+    info "reboot now. After boot, run: genzee create \"after rollback\"  # adopts @.next -> @"
+}
+
+cmd_remove() {
+    local raw="${1:-}"
+    [ -n "$raw" ] || die "missing generation id (usage: genzee remove <N>)"
+
+    ensure_snapshots_mounted
+    local id current booted
+    id=$(resolve_id "$raw")
+    current=$(read_current)
+    booted=$(current_subvol)
+
+    if [ "$id" = "$current" ]; then
+        die "cannot remove current generation $id"
+    fi
+    case "$booted" in
+        */"$id"|"$SNAPS_SUBVOL/$id")
+            die "cannot remove currently-booted generation $id"
+            ;;
+    esac
+
+    local tl
+    tl=$(mount_toplevel)
+    btrfs subvolume delete "$tl/$SNAPS_SUBVOL/$id" \
+        || { umount "$tl"; rmdir "$tl"; die "failed to delete $id"; }
+    umount "$tl"
+    rmdir "$tl" 2>/dev/null || true
+    rm -f "$SNAP_MOUNT/${id}.meta.toml"
+
+    rewrite_limine
+    ok "removed $id"
+}
+
+cmd_help() {
+    cat <<EOF
+genzee — btrfs generation manager for Zerene OS
+
+Usage: genzee <command> [args]
+
+Commands:
+  create <description>   Snapshot live root as a new read-only generation
+  list                   List generations (* = last created/current)
+  current                Show current generation and booted subvolume
+  rollback <N>           Roll back to generation N (reboot required)
+  remove <N>             Delete a generation
+  rewrite-limine         Regenerate /boot/limine.conf
+  cleanup-next           Delete staged @.next after a completed rollback
+  help                   Show this help
+
+Layout:
+  @                    live writable root
+  @.next               staged rollback target (temporary)
+  @snapshots/gen-N     read-only generations
+
+Limine menu:
+  /Zerene OS                              boots live (@ or @.next)
+  /Generations//Zerene OS (Generation N)  boots @snapshots/gen-N
+EOF
+}
+
+# Dispatch
+
+case "${1:-help}" in
+    create)
+        shift
+        cmd_create "${1:-}"
+        ;;
+    list)
+        cmd_list
+        ;;
+    current)
+        cmd_current
+        ;;
+    rollback)
+        shift
+        cmd_rollback "${1:-}"
+        ;;
+    remove)
+        shift
+        cmd_remove "${1:-}"
+        ;;
+    rewrite-limine|rewrite_limine)
+        cmd_adopt_if_needed 2>/dev/null || true
+        ensure_snapshots_mounted
+        rewrite_limine
+        ;;
+
+    cleanup-next|cleanup_next)
+        cmd_cleanup_next
+        ;;
+    help|-h|--help)
+        cmd_help
+        ;;
+    *)
+        echo "error: unknown command: ${1:-}" >&2
+        cmd_help
+        exit 1
+        ;;
+esac
