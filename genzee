@@ -1,5 +1,5 @@
 #!/bin/bash
-# genzee — btrfs generation manager for Zerene OS (Limine boot entries)
+# genzee — btrfs generation manager for Haliade OS (Limine boot entries)
 set -euo pipefail
 
 # help can run unprivileged; everything else needs root
@@ -194,14 +194,16 @@ next_id() {
 }
 
 write_meta_file() {
-    local path="$1" id="$2" desc="$3" ts
+    local path="$1" id="$2" desc="$3" cmdline="$4" ts
     ts=$(date +%s)
-    # escape quotes in description
+    # escape quotes in description and cmdline
     desc=${desc//\"/\\\"}
+    cmdline=${cmdline//\"/\\\"}
     cat > "$path" <<EOF
 id = "$id"
 timestamp = $ts
 description = "$desc"
+cmdline = "$cmdline"
 EOF
 }
 
@@ -226,6 +228,13 @@ load_meta_ts() {
     f=$(meta_path "$1")
     [ -f "$f" ] || return 0
     sed -n 's/^timestamp = //p' "$f" | head -1
+}
+
+load_meta_cmdline() {
+    local f
+    f=$(meta_path "$1")
+    [ -f "$f" ] || return 0
+    sed -n 's/^cmdline = "\(.*\)"/\1/p' "$f" | head -1
 }
 
 read_current() {
@@ -312,7 +321,7 @@ rewrite_limine() {
     local tmp name num
     tmp=$(mktemp)
     {
-        echo "# Limine configuration for Zerene OS — managed by genzee"
+        echo "# Limine configuration for Haliade OS — managed by genzee"
         echo "# Do not hand-edit generation entries; run: genzee rewrite-limine"
         echo
         echo "timeout: $timeout"
@@ -322,7 +331,7 @@ rewrite_limine() {
             echo "wallpaper_style: stretched"
         fi
         echo
-        echo "/Zerene OS"
+        echo "/Haliade OS"
         echo "    protocol: linux"
         echo "    kernel_path: boot():/${kernel}"
         echo "    module_path: boot():/${initrd}"
@@ -343,8 +352,9 @@ rewrite_limine() {
             echo "/Generations"
             for name in "${gens[@]}"; do
                 num=${name#gen-}
-                gen_cmd="root=${rspec} rootflags=subvol=${SNAPS_SUBVOL}/${name} rw"
-                [ -n "$extras" ] && gen_cmd="$gen_cmd $extras"
+                gen_cmd=$(load_meta_cmdline "$name")
+                # Fallback for legacy gens without stored cmdline
+                [ -z "$gen_cmd" ] && gen_cmd="root=${rspec} rootflags=subvol=${SNAPS_SUBVOL}/${name} rw ${extras}"
                 local desc
                 desc=$(load_meta_desc "$name")
                 desc=${desc:-"(no description)"}
@@ -381,12 +391,16 @@ cmd_create() {
     case "$source_subvol" in
         "$LIVE_SUBVOL"|@|"$NEXT_SUBVOL"|@.next) ;;
         "$SNAPS_SUBVOL"/*|@snapshots/*)
-            die "refusing to snapshot a read-only generation boot; boot into Zerene OS first"
+            die "refusing to snapshot a read-only generation boot; boot into Haliade OS first"
             ;;
         "") source_subvol="$LIVE_SUBVOL" ;;
     esac
 
     info "creating generation $id from $source_subvol ($desc)..."
+
+    # Capture the full current cmdline from limine.conf
+    local cur_cmdline
+    cur_cmdline=$(grep -m1 '^[[:space:]]*cmdline:' "$LIMINE_CONF" 2>/dev/null | sed 's/^cmdline:[[:space:]]*//' || true)
 
     tl=$(mount_toplevel)
     if [ ! -d "$tl/$source_subvol" ]; then
@@ -401,7 +415,7 @@ cmd_create() {
     rmdir "$tl" 2>/dev/null || true
 
     # RO snapshot: store metadata beside the snap
-    write_meta_file "$SNAP_MOUNT/${id}.meta.toml" "$id" "$desc"
+    write_meta_file "$SNAP_MOUNT/${id}.meta.toml" "$id" "$desc" "$cur_cmdline"
 
     set_current "$id"
     rewrite_limine
@@ -509,7 +523,7 @@ cmd_cleanup_next() {
     booted=$(current_subvol)
     case "$booted" in
         "$NEXT_SUBVOL"|@.next)
-            die "still booted from $NEXT_SUBVOL; boot into Zerene OS (@) first"
+            die "still booted from $NEXT_SUBVOL; boot into Haliade OS (@) first"
             ;;
     esac
     tl=$(mount_toplevel)
@@ -544,7 +558,9 @@ cmd_rollback() {
             backup="gen-backup-$(date +%s)"
             if [ -d "$tl/$LIVE_SUBVOL" ]; then
                 btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
-                write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" 2>/dev/null || true
+                local backup_cmdline
+                backup_cmdline=$(grep -m1 '^[[:space:]]*cmdline:' "$LIMINE_CONF" 2>/dev/null | sed 's/^cmdline:[[:space:]]*//' || true)
+                write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" "$backup_cmdline" 2>/dev/null || true
                 btrfs subvolume delete "$tl/$LIVE_SUBVOL" \
                     || { umount "$tl"; rmdir "$tl"; die "failed to delete $LIVE_SUBVOL"; }
             fi
@@ -556,7 +572,7 @@ cmd_rollback() {
             rmdir "$tl" 2>/dev/null || true
             set_current "$id"
             rewrite_limine "$LIVE_SUBVOL"
-            ok "rolled back to $id — reboot into Zerene OS to activate"
+            ok "rolled back to $id — reboot into Haliade OS to activate"
             return 0
             ;;
     esac
@@ -566,7 +582,9 @@ cmd_rollback() {
     tl=$(mount_toplevel)
     backup="gen-backup-$(date +%s)"
     btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
-    write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" 2>/dev/null || true
+    local backup_cmdline
+    backup_cmdline=$(grep -m1 '^[[:space:]]*cmdline:' "$LIMINE_CONF" 2>/dev/null | sed 's/^cmdline:[[:space:]]*//' || true)
+    write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" "$backup_cmdline" 2>/dev/null || true
 
     if [ -d "$tl/$NEXT_SUBVOL" ]; then
         btrfs subvolume delete "$tl/$NEXT_SUBVOL" 2>/dev/null || true
@@ -615,7 +633,7 @@ cmd_remove() {
 
 cmd_help() {
     cat <<EOF
-genzee — btrfs generation manager for Zerene OS
+genzee — btrfs generation manager for Haliade OS
 
 Usage: genzee <command> [args]
 
@@ -635,8 +653,8 @@ Layout:
   @snapshots/gen-N     read-only generations
 
 Limine menu:
-  /Zerene OS                              boots live (@ or @.next)
-  /Generations//Zerene OS (Generation N)  boots @snapshots/gen-N
+  /Haliade OS                              boots live (@ or @.next)
+  /Generations//Haliade OS (Generation N)  boots @snapshots/gen-N
 EOF
 }
 
