@@ -547,7 +547,7 @@ cmd_rollback() {
     local id
     id=$(resolve_id "$raw")
 
-    local booted tl backup
+    local booted tl
     booted=$(current_subvol)
 
     # Recovery path: booted from a generation — can replace @ directly
@@ -555,12 +555,7 @@ cmd_rollback() {
         "$SNAPS_SUBVOL"/*|@snapshots/*)
             info "booted from snapshot; replacing live $LIVE_SUBVOL with $id..."
             tl=$(mount_toplevel)
-            backup="gen-backup-$(date +%s)"
             if [ -d "$tl/$LIVE_SUBVOL" ]; then
-                btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
-                local backup_cmdline
-                backup_cmdline=$(grep -m1 '^[[:space:]]*cmdline:' "$LIMINE_CONF" 2>/dev/null | sed 's/^cmdline:[[:space:]]*//' || true)
-                write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" "$backup_cmdline" 2>/dev/null || true
                 btrfs subvolume delete "$tl/$LIVE_SUBVOL" \
                     || { umount "$tl"; rmdir "$tl"; die "failed to delete $LIVE_SUBVOL"; }
             fi
@@ -580,11 +575,6 @@ cmd_rollback() {
     # Live path: cannot delete mounted @ — stage @.next and switch default boot
     info "staging rollback of $id as $NEXT_SUBVOL (live $LIVE_SUBVOL is mounted)..."
     tl=$(mount_toplevel)
-    backup="gen-backup-$(date +%s)"
-    btrfs subvolume snapshot -r "$tl/$LIVE_SUBVOL" "$tl/$SNAPS_SUBVOL/$backup" 2>/dev/null || true
-    local backup_cmdline
-    backup_cmdline=$(grep -m1 '^[[:space:]]*cmdline:' "$LIMINE_CONF" 2>/dev/null | sed 's/^cmdline:[[:space:]]*//' || true)
-    write_meta_file "$SNAP_MOUNT/${backup}.meta.toml" "$backup" "auto-backup before rollback to $id" "$backup_cmdline" 2>/dev/null || true
 
     if [ -d "$tl/$NEXT_SUBVOL" ]; then
         btrfs subvolume delete "$tl/$NEXT_SUBVOL" 2>/dev/null || true
